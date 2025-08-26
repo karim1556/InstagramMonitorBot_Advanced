@@ -1,0 +1,16 @@
+version: "3.8"
+services:
+  instagram-tracker:
+    build: .
+    container_name: instagram-tracker
+    restart: unless-stopped
+    environment:
+      - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN}
+      - INSTAGRAM_SESSION_ID=${INSTAGRAM_SESSION_ID}
+    volumes:
+      # Persist data.json and logs
+      - ./data.json:/app/data.json
+      - ./instagram_tracker.log:/app/instagram_tracker.log
+    # If you need timezone consistency inside the container
+    # - /etc/timezone:/etc/timezone:ro
+    # - /etc/localtime:/etc/localtime:ro

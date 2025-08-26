@@ -1,0 +1,6 @@
+{
+  "bot_token": "REDACTED_TELEGRAM_BOT_TOKEN",
+  "discord_token": "REDACTED_DISCORD_BOT_TOKEN",
+  "admin_chat_id": "7962264900",
+  "check_interval": 60
+}

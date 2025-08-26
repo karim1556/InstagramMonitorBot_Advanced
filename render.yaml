@@ -1,0 +1,23 @@
+services:
+  - type: worker
+    name: instagram-tracker
+    env: python
+    plan: starter
+    buildCommand: |
+      pip install --no-cache-dir -r requirements.txt && 
+      mkdir -p /var/data && 
+      if [ ! -f /var/data/data.json ]; then echo '{"users": {}, "meta": {"last_checked": ""}}' > /var/data/data.json; fi && 
+      ln -sf /var/data/data.json data.json && 
+      touch /var/data/instagram_tracker.log && 
+      ln -sf /var/data/instagram_tracker.log instagram_tracker.log
+    startCommand: python instagram_tracker.py
+    autoDeploy: true
+    # Mount a persistent disk so data.json and logs survive deploys/restarts
+    disk:
+      name: tracker-data
+      mountPath: /var/data
+    envVars:
+      - key: DISCORD_BOT_TOKEN
+        sync: false
+      - key: INSTAGRAM_SESSION_ID
+        sync: false
