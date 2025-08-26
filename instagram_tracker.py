@@ -80,24 +80,7 @@
 #     embed.add_field(name="Followers", value=f"{user_data.get('followers', 0):,}", inline=True)
 #     return embed
 
-# --- Minimal HTTP server for Render Web Service ---
-async def health_handler(request: web.Request) -> web.Response:
-    return web.json_response({"status": "ok"})
-
-async def start_http_server() -> web.AppRunner:
-    app = web.Application()
-    app.router.add_get("/health", health_handler)
-    app.router.add_get("/healthz", health_handler)
-    app.router.add_get("/", health_handler)
-
-    runner = web.AppRunner(app)
-    await runner.setup()
-
-    port = int(os.getenv("PORT", 10000))
-    site = web.TCPSite(runner, host="0.0.0.0", port=port)
-    await site.start()
-    logger.info(f"HTTP health server started on port {port}")
-    return runner
+ 
 
 # @bot.tree.command(name="adduser", description="Start tracking an Instagram username.")
 # async def add_user(interaction: discord.Interaction, username: str):
@@ -271,10 +254,6 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")  # Discord bot token
 SESSION_ID = os.getenv("INSTAGRAM_SESSION_ID")  # From dummy IG account
 
-# Critical check for environment variables
-if not TOKEN or not SESSION_ID:
-    logger.critical("Missing environment variables! Check DISCORD_BOT_TOKEN and INSTAGRAM_SESSION_ID in your .env file.")
-    exit()
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 
 # Configure logging
@@ -378,6 +357,25 @@ def build_embed(title, description, user_data, color):
     embed.add_field(name="👥 Followers", value=f"{user_data.get('followers', 0):,}", inline=True)
     embed.set_footer(text=f"Tracked by Instagram Tracker • {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
     return embed
+
+# --- Minimal HTTP server for Render Web Service ---
+async def health_handler(request: web.Request) -> web.Response:
+    return web.json_response({"status": "ok"})
+
+async def start_http_server() -> web.AppRunner:
+    app = web.Application()
+    app.router.add_get("/health", health_handler)
+    app.router.add_get("/healthz", health_handler)
+    app.router.add_get("/", health_handler)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    port = int(os.getenv("PORT", 10000))
+    site = web.TCPSite(runner, host="0.0.0.0", port=port)
+    await site.start()
+    logger.info(f"HTTP health server started on port {port}")
+    return runner
 
 @bot.tree.command(name="adduser", description="Start tracking an Instagram account")
 async def add_user(interaction: discord.Interaction, username: str):
@@ -651,3 +649,20 @@ async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandNotFound):
         return
     logger.error(f"Command error: {str(error)}")
+
+async def main():
+    if not TOKEN or not SESSION_ID:
+        logger.critical("Missing environment variables! Check DISCORD_BOT_TOKEN and INSTAGRAM_SESSION_ID")
+        return
+
+    runner = await start_http_server()
+    try:
+        await bot.start(TOKEN)
+    finally:
+        await runner.cleanup()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Shutdown requested by user")
