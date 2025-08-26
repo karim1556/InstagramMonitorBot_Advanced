@@ -80,6 +80,25 @@
 #     embed.add_field(name="Followers", value=f"{user_data.get('followers', 0):,}", inline=True)
 #     return embed
 
+# --- Minimal HTTP server for Render Web Service ---
+async def health_handler(request: web.Request) -> web.Response:
+    return web.json_response({"status": "ok"})
+
+async def start_http_server() -> web.AppRunner:
+    app = web.Application()
+    app.router.add_get("/health", health_handler)
+    app.router.add_get("/healthz", health_handler)
+    app.router.add_get("/", health_handler)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    port = int(os.getenv("PORT", 10000))
+    site = web.TCPSite(runner, host="0.0.0.0", port=port)
+    await site.start()
+    logger.info(f"HTTP health server started on port {port}")
+    return runner
+
 # @bot.tree.command(name="adduser", description="Start tracking an Instagram username.")
 # async def add_user(interaction: discord.Interaction, username: str):
 #     await interaction.response.defer()  # Tell Discord we're working on it
@@ -238,6 +257,7 @@ import discord
 import asyncio
 import json
 import aiohttp
+from aiohttp import web
 import logging
 import os
 from datetime import datetime
@@ -631,9 +651,3 @@ async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandNotFound):
         return
     logger.error(f"Command error: {str(error)}")
-
-if __name__ == "__main__":
-    if not TOKEN or not SESSION_ID:
-        logger.critical("Missing environment variables! Check DISCORD_BOT_TOKEN and INSTAGRAM_SESSION_ID")
-    else:
-        bot.run(TOKEN)

@@ -1,8 +1,8 @@
 services:
-  - type: worker
+  - type: web
     name: instagram-tracker
     env: python
-    plan: starter
+    runtime: python
     buildCommand: |
       pip install --no-cache-dir -r requirements.txt && 
       mkdir -p /var/data && 
@@ -12,6 +12,7 @@ services:
       ln -sf /var/data/instagram_tracker.log instagram_tracker.log
     startCommand: python instagram_tracker.py
     autoDeploy: true
+    healthCheckPath: /health
     # Mount a persistent disk so data.json and logs survive deploys/restarts
     disk:
       name: tracker-data
