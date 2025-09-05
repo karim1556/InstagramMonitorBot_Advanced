@@ -279,6 +279,38 @@ INSTAGRAM_HEADERS = {
     "Cookie": f"sessionid={SESSION_ID};"
 }
 
+# --- Persistent data storage configuration ---
+# Prefer a persistent directory if available (e.g., Render persistent disk at /var/data).
+# Falls back to a local hidden folder inside the container or repo when not provided.
+RENDER_HINT = os.getenv("RENDER") or os.getenv("RENDER_SERVICE_ID") or os.getenv("RENDER_INSTANCE_ID")
+DEFAULT_DATA_DIR = "/var/data" if RENDER_HINT else os.path.join(".", ".localdata")
+DATA_DIR = os.getenv("DATA_DIR", DEFAULT_DATA_DIR)
+DATA_FILE = os.path.join(DATA_DIR, "data.json")
+
+def _ensure_data_dir():
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+    except Exception as e:
+        logger.error(f"Failed to create data dir {DATA_DIR}: {e}")
+
+def _migrate_legacy_file():
+    """If legacy ./data.json exists and persistent file doesn't, migrate once."""
+    legacy_path = os.path.join(".", "data.json")
+    if os.path.exists(legacy_path) and not os.path.exists(DATA_FILE):
+        try:
+            with open(legacy_path, "r") as f:
+                raw = f.read()
+            # Validate JSON before migrating
+            _ = json.loads(raw)
+            with open(DATA_FILE, "w") as f:
+                f.write(raw)
+            logger.info(f"Migrated legacy data from {legacy_path} to {DATA_FILE}")
+        except Exception as e:
+            logger.warning(f"Could not migrate legacy data.json: {e}")
+
+_ensure_data_dir()
+_migrate_legacy_file()
+
 @bot.event
 async def on_ready():
     logger.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
@@ -291,9 +323,9 @@ async def on_ready():
 
 def load_data():
     try:
-        with open("data.json", "r") as f:
+        with open(DATA_FILE, "r") as f:
             data = json.load(f)
-            # Check for old format and migrate
+            # Check for old format and migrate in-memory
             if "users" not in data:
                 logger.info("Old data format detected. Migrating to new structure.")
                 return {"users": data, "meta": {"last_checked": ""}}
@@ -303,8 +335,13 @@ def load_data():
 
 def save_data(data):
     data["meta"]["last_checked"] = datetime.utcnow().isoformat()
-    with open("data.json", "w") as f:
-        json.dump(data, f, indent=2)
+    tmp_path = DATA_FILE + ".tmp"
+    try:
+        with open(tmp_path, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp_path, DATA_FILE)
+    except Exception as e:
+        logger.error(f"Failed to save data atomically to {DATA_FILE}: {e}")
 
 async def fetch_instagram_data(session, username):
     url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"

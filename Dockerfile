@@ -4,6 +4,8 @@ FROM python:3.11-slim
 # Prevent Python from writing .pyc files and buffer stdout/stderr
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
+    \
+    DATA_DIR=/var/data
 
 WORKDIR /app
 
@@ -21,6 +23,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy project files
 COPY . .
+
+# Ensure data directory exists (the app also creates it at runtime if missing)
+RUN mkdir -p "$DATA_DIR"
 
 # Default command: run the Instagram tracker bot
 CMD ["python", "instagram_tracker.py"]

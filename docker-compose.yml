@@ -8,9 +8,8 @@ services:
       - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN}
       - INSTAGRAM_SESSION_ID=${INSTAGRAM_SESSION_ID}
     volumes:
-      # Persist data.json and logs
-      - ./data.json:/app/data.json
-      - ./instagram_tracker.log:/app/instagram_tracker.log
+      # Persist app state and logs in a host directory
+      - ./data:/var/data
     # If you need timezone consistency inside the container
     # - /etc/timezone:/etc/timezone:ro
     # - /etc/localtime:/etc/localtime:ro
