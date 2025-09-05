@@ -283,7 +283,8 @@ INSTAGRAM_HEADERS = {
 # Prefer a persistent directory if available (e.g., Render persistent disk at /var/data).
 # Falls back to a local hidden folder inside the container or repo when not provided.
 RENDER_HINT = os.getenv("RENDER") or os.getenv("RENDER_SERVICE_ID") or os.getenv("RENDER_INSTANCE_ID")
-DEFAULT_DATA_DIR = "/var/data" if RENDER_HINT else os.path.join(".", ".localdata")
+# Prefer /var/data if present in the filesystem even if no env hints
+DEFAULT_DATA_DIR = "/var/data" if os.path.isdir("/var/data") or RENDER_HINT else os.path.join(".", ".localdata")
 DATA_DIR = os.getenv("DATA_DIR", DEFAULT_DATA_DIR)
 DATA_FILE = os.path.join(DATA_DIR, "data.json")
 
@@ -367,6 +368,7 @@ async def fetch_instagram_data(session, username):
                 
             user = data['data']['user']
             return {
+                "id": user.get("id"),
                 "username": user.get("username"),
                 "full_name": user.get("full_name", ""),
                 "is_verified": user.get("is_verified", False),
@@ -441,6 +443,7 @@ async def add_user(interaction: discord.Interaction, username: str):
         data["users"][username] = {
             "added_by": str(interaction.user.id),
             "added_at": datetime.utcnow().isoformat(),
+            "instagram_id": user_data.get("id"),
             "followers": user_data["followers"],
             "is_verified": user_data["is_verified"],
             "bio": user_data["bio"],
@@ -550,6 +553,10 @@ async def user_info(interaction: discord.Interaction, username: str):
         # Add tracking status if applicable
         if username in data["users"]:
             last_checked = datetime.fromisoformat(data["users"][username]["last_checked"])
+            # Update stored instagram_id if missing
+            if not data["users"][username].get("instagram_id") and user_data.get("id"):
+                data["users"][username]["instagram_id"] = user_data.get("id")
+                save_data(data)
             embed.add_field(
                 name="📊 Tracking Status", 
                 value=f"Tracked since {last_checked.strftime('%Y-%m-%d')}",
@@ -566,16 +573,41 @@ async def check_instagram():
         return
         
     async with aiohttp.ClientSession() as session:
-        for i, (username, user_data) in enumerate(data["users"].items()):
+        # Use a snapshot list to allow renames/removals safely during iteration
+        for i, (username, user_data) in enumerate(list(data["users"].items())):
             # Rate limit protection
             if i > 0:
                 await asyncio.sleep(10)  # 10s between requests
             
             try:
+                # If this username was removed after we loaded 'data', skip it
+                latest = load_data()
+                if username not in latest.get("users", {}):
+                    continue
                 current = await fetch_instagram_data(session, username)
                 
                 # Skip failed checks
                 if not current or isinstance(current, str):
+                    # If 'not_found', try to detect a handle rename and migrate
+                    if current == "not_found":
+                        try:
+                            new_username = await try_detect_username_change(session, username, user_data)
+                            if new_username and new_username != username:
+                                # migrate key
+                                data["users"][new_username] = data["users"].pop(username)
+                                data["users"][new_username]["last_checked"] = datetime.utcnow().isoformat()
+                                save_data(data)
+                                await notify_user(
+                                    user_data["added_by"],
+                                    build_embed(
+                                        "🆕 Username Changed",
+                                        f"@{username} is now @{new_username}",
+                                        {**user_data, "username": new_username},
+                                        discord.Color.teal()
+                                    )
+                                )
+                        except Exception as e:
+                            logger.warning(f"Rename detection failed for @{username}: {e}")
                     continue
                     
                 # 1. Check if account was reactivated
@@ -592,6 +624,27 @@ async def check_instagram():
                         )
                     )
                 
+                # 1b. If Instagram reports a different username for the same account, migrate
+                if current.get("username") and current.get("username") != username:
+                    new_username = current.get("username")
+                    data["users"][new_username] = data["users"].pop(username)
+                    data["users"][new_username]["last_checked"] = datetime.utcnow().isoformat()
+                    # Keep instagram_id updated
+                    if current.get("id"):
+                        data["users"][new_username]["instagram_id"] = current.get("id")
+                    save_data(data)
+                    await notify_user(
+                        user_data["added_by"],
+                        build_embed(
+                            "🆕 Username Changed",
+                            f"@{username} is now @{new_username}",
+                            current,
+                            discord.Color.teal()
+                        )
+                    )
+                    # Continue processing under new key in next cycles
+                    continue
+
                 # 2. Verify account status
                 if current == "not_found":
                     if user_data.get("status") != "not_found":
@@ -668,6 +721,9 @@ async def check_instagram():
 
                 # Finally, update the last checked timestamp and save if needed
                 data["users"][username]["last_checked"] = datetime.utcnow().isoformat()
+                # Update instagram_id if we have a new one
+                if current.get("id"):
+                    data["users"][username]["instagram_id"] = current.get("id")
                 if something_changed:
                     save_data(data)
                     
@@ -703,3 +759,63 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Shutdown requested by user")
+
+# --- Helper: detect username changes via Instagram topsearch ---
+async def try_detect_username_change(session, old_username: str, stored_user_data: dict) -> str | None:
+    """
+    Try to find a new username if the old one returns 404.
+    Strategy:
+      1) Call topsearch with the old username.
+      2) Prefer matches with the same instagram_id (pk) if we have it.
+      3) Else, heuristically match by full_name and/or profile_pic.
+    Returns the new username or None.
+    """
+    try:
+        query = old_username
+        url = f"https://www.instagram.com/web/search/topsearch/?context=blended&query={query}"
+        async with session.get(url, headers=INSTAGRAM_HEADERS) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json()
+        users = data.get("users", [])
+        if not users:
+            return None
+
+        target_id = stored_user_data.get("instagram_id")
+        # 1) Exact match on id (pk)
+        if target_id:
+            for item in users:
+                u = item.get("user", {})
+                if str(u.get("pk")) == str(target_id) and u.get("username") != old_username:
+                    return u.get("username")
+
+        # 2) Heuristic match by full_name
+        full_name = stored_user_data.get("full_name") or stored_user_data.get("bio")
+        if full_name:
+            for item in users:
+                u = item.get("user", {})
+                if u.get("full_name") == full_name and u.get("username") != old_username:
+                    return u.get("username")
+
+        # 3) Fallback: choose the first non-old username with similar profile pic if available
+        pic = stored_user_data.get("profile_pic_url")
+        if pic:
+            for item in users:
+                u = item.get("user", {})
+                if u.get("username") != old_username and (u.get("profile_pic_url") or u.get("profile_pic_url_hd")):
+                    return u.get("username")
+        return None
+    except Exception:
+        return None
+
+@bot.tree.command(name="storageinfo", description="Show current storage path and tracked usernames (admin only)")
+async def storage_info(interaction: discord.Interaction):
+    # Basic check: only allow the user who invoked to see
+    data = load_data()
+    usernames = ", ".join(sorted(list(data.get("users", {}).keys()))) or "(none)"
+    msg = (
+        f"DATA_DIR: {DATA_DIR}\n"
+        f"DATA_FILE: {DATA_FILE}\n"
+        f"Tracked: {usernames}"
+    )
+    await interaction.response.send_message(msg, ephemeral=True)
