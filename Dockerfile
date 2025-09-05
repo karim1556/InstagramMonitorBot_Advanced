@@ -3,8 +3,7 @@ FROM python:3.11-slim
 
 # Prevent Python from writing .pyc files and buffer stdout/stderr
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
-    \
+    PYTHONUNBUFFERED=1 \
     DATA_DIR=/var/data
 
 WORKDIR /app
