@@ -459,13 +459,77 @@ async def add_user(interaction: discord.Interaction, username: str):
             discord.Color.green()
         )
         await interaction.followup.send(embed=embed)
-        
-        # Send confirmation DM
-        try:
-            user = await bot.fetch_user(interaction.user.id)
-            await user.send(f"🔔 You'll receive updates for @{username} in DMs")
-        except discord.Forbidden:
-            logger.warning(f"Couldn't DM user {interaction.user.id}")
+
+# --- Helper: detect username changes via Instagram topsearch ---
+async def try_detect_username_change(session, old_username: str, stored_user_data: dict) -> str | None:
+    """
+    Try to find a new username if the old one returns 404.
+    Strategy:
+      1) Call topsearch with the old username.
+      2) Prefer matches with the same instagram_id (pk) if we have it.
+      3) Else, heuristically match by full_name and/or profile_pic.
+    Returns the new username or None.
+    """
+    try:
+        query = old_username
+        url = f"https://www.instagram.com/web/search/topsearch/?context=blended&query={query}"
+        async with session.get(url, headers=INSTAGRAM_HEADERS) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json()
+        users = data.get("users", [])
+        if not users:
+            return None
+
+        target_id = stored_user_data.get("instagram_id")
+        # 1) Exact match on id (pk)
+        if target_id:
+            for item in users:
+                u = item.get("user", {})
+                if str(u.get("pk")) == str(target_id) and u.get("username") != old_username:
+                    return u.get("username")
+
+        # 2) Heuristic match by full_name
+        full_name = stored_user_data.get("full_name") or stored_user_data.get("bio")
+        if full_name:
+            for item in users:
+                u = item.get("user", {})
+                if u.get("full_name") == full_name and u.get("username") != old_username:
+                    return u.get("username")
+
+        # 3) Fallback: choose the first non-old username with similar profile pic if available
+        pic = stored_user_data.get("profile_pic_url")
+        if pic:
+            for item in users:
+                u = item.get("user", {})
+                if u.get("username") != old_username and (u.get("profile_pic_url") or u.get("profile_pic_url_hd")):
+                    return u.get("username")
+        return None
+    except Exception:
+        return None
+
+@bot.tree.command(name="storageinfo", description="Show current storage path and tracked usernames (ephemeral)")
+async def storage_info(interaction: discord.Interaction):
+    data = load_data()
+    usernames = ", ".join(sorted(list(data.get("users", {}).keys()))) or "(none)"
+    msg = (
+        f"DATA_DIR: {DATA_DIR}\n"
+        f"DATA_FILE: {DATA_FILE}\n"
+        f"Tracked: {usernames}"
+    )
+    await interaction.response.send_message(msg, ephemeral=True)
+
+@bot.tree.command(name="purgeuser", description="Force remove a username from persistent storage (owner only)")
+async def purge_user(interaction: discord.Interaction, username: str):
+    # Only allow the user who added it or the guild owner/admin; keep it simple and allow invoker
+    username = username.lower()
+    data = load_data()
+    if username in data.get("users", {}):
+        del data["users"][username]
+        save_data(data)
+        await interaction.response.send_message(f"🗑️ Purged @{username} from storage.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"@{username} not found in storage.", ephemeral=True)
 
 @bot.tree.command(name="removeuser", description="Stop tracking an Instagram account")
 async def remove_user(interaction: discord.Interaction, username: str):
@@ -569,6 +633,10 @@ async def user_info(interaction: discord.Interaction, username: str):
 async def check_instagram():
     logger.info("Starting account checks...")
     data = load_data()
+    try:
+        logger.info(f"Tracked set at cycle start: {list(data.get('users', {}).keys())}")
+    except Exception:
+        pass
     if not data["users"]:
         return
         
@@ -583,6 +651,7 @@ async def check_instagram():
                 # If this username was removed after we loaded 'data', skip it
                 latest = load_data()
                 if username not in latest.get("users", {}):
+                    logger.info(f"Skipping @{username} - removed from tracking before fetch")
                     continue
                 current = await fetch_instagram_data(session, username)
                 
@@ -759,63 +828,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Shutdown requested by user")
-
-# --- Helper: detect username changes via Instagram topsearch ---
-async def try_detect_username_change(session, old_username: str, stored_user_data: dict) -> str | None:
-    """
-    Try to find a new username if the old one returns 404.
-    Strategy:
-      1) Call topsearch with the old username.
-      2) Prefer matches with the same instagram_id (pk) if we have it.
-      3) Else, heuristically match by full_name and/or profile_pic.
-    Returns the new username or None.
-    """
-    try:
-        query = old_username
-        url = f"https://www.instagram.com/web/search/topsearch/?context=blended&query={query}"
-        async with session.get(url, headers=INSTAGRAM_HEADERS) as resp:
-            if resp.status != 200:
-                return None
-            data = await resp.json()
-        users = data.get("users", [])
-        if not users:
-            return None
-
-        target_id = stored_user_data.get("instagram_id")
-        # 1) Exact match on id (pk)
-        if target_id:
-            for item in users:
-                u = item.get("user", {})
-                if str(u.get("pk")) == str(target_id) and u.get("username") != old_username:
-                    return u.get("username")
-
-        # 2) Heuristic match by full_name
-        full_name = stored_user_data.get("full_name") or stored_user_data.get("bio")
-        if full_name:
-            for item in users:
-                u = item.get("user", {})
-                if u.get("full_name") == full_name and u.get("username") != old_username:
-                    return u.get("username")
-
-        # 3) Fallback: choose the first non-old username with similar profile pic if available
-        pic = stored_user_data.get("profile_pic_url")
-        if pic:
-            for item in users:
-                u = item.get("user", {})
-                if u.get("username") != old_username and (u.get("profile_pic_url") or u.get("profile_pic_url_hd")):
-                    return u.get("username")
-        return None
-    except Exception:
-        return None
-
-@bot.tree.command(name="storageinfo", description="Show current storage path and tracked usernames (admin only)")
-async def storage_info(interaction: discord.Interaction):
-    # Basic check: only allow the user who invoked to see
-    data = load_data()
-    usernames = ", ".join(sorted(list(data.get("users", {}).keys()))) or "(none)"
-    msg = (
-        f"DATA_DIR: {DATA_DIR}\n"
-        f"DATA_FILE: {DATA_FILE}\n"
-        f"Tracked: {usernames}"
-    )
-    await interaction.response.send_message(msg, ephemeral=True)
