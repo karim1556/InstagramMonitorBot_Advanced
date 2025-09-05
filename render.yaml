@@ -6,10 +6,8 @@ services:
     buildCommand: |
       pip install --no-cache-dir -r requirements.txt && 
       mkdir -p /var/data && 
-      if [ ! -f /var/data/data.json ]; then echo '{"users": {}, "meta": {"last_checked": ""}}' > /var/data/data.json; fi && 
-      ln -sf /var/data/data.json data.json && 
-      touch /var/data/instagram_tracker.log && 
-      ln -sf /var/data/instagram_tracker.log instagram_tracker.log
+      if [ ! -f /var/data/data.json ]; then echo '{"users": {}, "by_user": {}, "meta": {"last_checked": ""}}' > /var/data/data.json; fi && 
+      touch /var/data/instagram_tracker.log
     startCommand: python instagram_tracker.py
     autoDeploy: true
     healthCheckPath: /health
