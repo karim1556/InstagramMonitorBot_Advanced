@@ -253,6 +253,7 @@ load_dotenv()
 # Environment setup - USE .env FILE FOR SECURITY
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")  # Discord bot token
 SESSION_ID = os.getenv("INSTAGRAM_SESSION_ID")  # From dummy IG account
+RESET_ALL_ENABLED = str(os.getenv("RESET_ALL_ENABLED", "false")).lower() == "true"
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 
@@ -559,6 +560,25 @@ async def clear_bucket(interaction: discord.Interaction):
     save_data(data)
     await interaction.response.send_message(
         f"🧹 Cleared {cleared} tracked account(s) from your bucket. You will no longer receive DMs until you add users again.",
+        ephemeral=True
+    )
+
+# Note: Global admin-wide clear removed. Each user can clear their own bucket using /clear.
+@bot.tree.command(name="clearall", description="Wipe ALL users and targets (feature-flagged)")
+async def clear_all(interaction: discord.Interaction):
+    if not RESET_ALL_ENABLED:
+        await interaction.response.send_message(
+            "❌ Global clear is disabled. Set RESET_ALL_ENABLED=true to enable temporarily.",
+            ephemeral=True
+        )
+        return
+    data = load_data()
+    total_users = len(data.get("by_user", {}))
+    total_targets = sum(len(b.get("targets", {})) for b in data.get("by_user", {}).values())
+    data["by_user"] = {}
+    save_data(data)
+    await interaction.response.send_message(
+        f"🧨 Cleared {total_targets} targets across {total_users} user bucket(s). Storage is now fresh.",
         ephemeral=True
     )
 
