@@ -326,10 +326,24 @@ def load_data():
     try:
         with open(DATA_FILE, "r") as f:
             data = json.load(f)
-            # Check for old format and migrate in-memory
-            if "users" not in data:
-                logger.info("Old data format detected. Migrating to new structure.")
-                return {"users": data, "meta": {"last_checked": ""}}
+            # If completely empty, seed structure
+            if not isinstance(data, dict):
+                data = {}
+            data.setdefault("meta", {"last_checked": ""})
+            # Migrate legacy flat structure {"users": {username: {..., added_by}}} to per-user structure
+            if "by_user" not in data:
+                data["by_user"] = {}
+            if "users" in data and isinstance(data["users"], dict) and data["users"]:
+                logger.info("Migrating legacy users -> by_user structure")
+                for uname, info in list(data["users"].items()):
+                    owner = str(info.get("added_by") or info.get("addedBy") or "")
+                    if not owner:
+                        # Skip if we don't know who added it
+                        continue
+                    user_bucket = data["by_user"].setdefault(owner, {"targets": {}})
+                    user_bucket["targets"][uname] = info
+                # Clear legacy after migration to avoid duplicate processing
+                data["users"] = {}
             return data
     except (FileNotFoundError, json.JSONDecodeError):
         return {"users": {}, "meta": {"last_checked": ""}}
@@ -421,9 +435,10 @@ async def add_user(interaction: discord.Interaction, username: str):
     await interaction.response.defer(ephemeral=True)
     username = username.lower()
     data = load_data()
-    
-    if username in data["users"]:
-        await interaction.followup.send(f"⚠️ `@{username}` is already being tracked.", ephemeral=True)
+    user_id = str(interaction.user.id)
+    bucket = data.setdefault("by_user", {}).setdefault(user_id, {"targets": {}})
+    if username in bucket["targets"]:
+        await interaction.followup.send(f"⚠️ `@{username}` is already in your tracking list.", ephemeral=True)
         return
         
     async with aiohttp.ClientSession() as session:
@@ -439,9 +454,9 @@ async def add_user(interaction: discord.Interaction, username: str):
             await interaction.followup.send(f"❌ Instagram user `@{username}` doesn't exist.", ephemeral=True)
             return
             
-        # Store user data
-        data["users"][username] = {
-            "added_by": str(interaction.user.id),
+        # Store user-specific data
+        bucket["targets"][username] = {
+            "added_by": user_id,
             "added_at": datetime.utcnow().isoformat(),
             "instagram_id": user_data.get("id"),
             "followers": user_data["followers"],
@@ -524,28 +539,43 @@ async def purge_user(interaction: discord.Interaction, username: str):
     # Only allow the user who added it or the guild owner/admin; keep it simple and allow invoker
     username = username.lower()
     data = load_data()
-    if username in data.get("users", {}):
-        del data["users"][username]
+    user_id = str(interaction.user.id)
+    bucket = data.setdefault("by_user", {}).setdefault(user_id, {"targets": {}})
+    if username in bucket.get("targets", {}):
+        del bucket["targets"][username]
         save_data(data)
-        await interaction.response.send_message(f"🗑️ Purged @{username} from storage.", ephemeral=True)
+        await interaction.response.send_message(f"🗑️ Purged @{username} from your storage.", ephemeral=True)
     else:
-        await interaction.response.send_message(f"@{username} not found in storage.", ephemeral=True)
+        await interaction.response.send_message(f"@{username} not found in your storage.", ephemeral=True)
 
-@bot.tree.command(name="removeuser", description="Stop tracking an Instagram account")
+@bot.tree.command(name="clear", description="Clear ALL usernames from YOUR tracking bucket")
+async def clear_bucket(interaction: discord.Interaction):
+    data = load_data()
+    user_id = str(interaction.user.id)
+    # Ensure bucket exists even if absent
+    bucket = data.setdefault("by_user", {}).setdefault(user_id, {"targets": {}})
+    cleared = len(bucket.get("targets", {}))
+    bucket["targets"] = {}
+    save_data(data)
+    await interaction.response.send_message(
+        f"🧹 Cleared {cleared} tracked account(s) from your bucket. You will no longer receive DMs until you add users again.",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="removeuser", description="Stop tracking an Instagram account (from YOUR list)")
 async def remove_user(interaction: discord.Interaction, username: str):
     username = username.lower()
     data = load_data()
-    
-    if username not in data["users"]:
+    user_id = str(interaction.user.id)
+    bucket = data.setdefault("by_user", {}).setdefault(user_id, {"targets": {}})
+    if username not in bucket["targets"]:
         await interaction.response.send_message(
-            f"❌ `@{username}` is not being tracked.",
+            f"❌ `@{username}` is not in your tracking list.",
             ephemeral=True
         )
         return
         
-    # Get user who added for notification
-    added_by = data["users"][username]["added_by"]
-    del data["users"][username]
+    del bucket["targets"][username]
     save_data(data)
     
     # Send confirmation
@@ -553,18 +583,13 @@ async def remove_user(interaction: discord.Interaction, username: str):
         f"❌ Stopped tracking `@{username}`",
         ephemeral=True
     )
-    
-    # Notify original adder
-    try:
-        user = await bot.fetch_user(int(added_by))
-        await user.send(f"🚫 No longer tracking @{username}")
-    except (discord.NotFound, discord.Forbidden):
-        pass
 
 @bot.tree.command(name="listusers", description="Show all tracked accounts")
 async def list_users(interaction: discord.Interaction):
     data = load_data()
-    if not data["users"]:
+    user_id = str(interaction.user.id)
+    bucket = data.setdefault("by_user", {}).setdefault(user_id, {"targets": {}})
+    if not bucket["targets"]:
         await interaction.response.send_message(
             "📭 No accounts being tracked",
             ephemeral=True
@@ -576,7 +601,7 @@ async def list_users(interaction: discord.Interaction):
         color=discord.Color.blurple()
     )
     
-    for i, (username, info) in enumerate(data["users"].items(), 1):
+    for i, (username, info) in enumerate(bucket["targets"].items(), 1):
         added_by = await bot.fetch_user(int(info["added_by"]))
         embed.add_field(
             name=f"{i}. @{username}",
@@ -584,7 +609,7 @@ async def list_users(interaction: discord.Interaction):
             inline=False
         )
     
-    embed.set_footer(text=f"Total tracked: {len(data['users'])} accounts")
+    embed.set_footer(text=f"Total tracked: {len(bucket['targets'])} accounts")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="userinfo", description="Show current account info")
@@ -615,11 +640,13 @@ async def user_info(interaction: discord.Interaction, username: str):
         )
         
         # Add tracking status if applicable
-        if username in data["users"]:
-            last_checked = datetime.fromisoformat(data["users"][username]["last_checked"])
+        user_id = str(interaction.user.id)
+        bucket = data.setdefault("by_user", {}).setdefault(user_id, {"targets": {}})
+        if username in bucket["targets"]:
+            last_checked = datetime.fromisoformat(bucket["targets"][username]["last_checked"])
             # Update stored instagram_id if missing
-            if not data["users"][username].get("instagram_id") and user_data.get("id"):
-                data["users"][username]["instagram_id"] = user_data.get("id")
+            if not bucket["targets"][username].get("instagram_id") and user_data.get("id"):
+                bucket["targets"][username]["instagram_id"] = user_data.get("id")
                 save_data(data)
             embed.add_field(
                 name="📊 Tracking Status", 
@@ -634,24 +661,36 @@ async def check_instagram():
     logger.info("Starting account checks...")
     data = load_data()
     try:
-        logger.info(f"Tracked set at cycle start: {list(data.get('users', {}).keys())}")
+        owners = data.get("by_user", {})
+        union = sorted({u for _, b in owners.items() for u in b.get("targets", {}).keys()})
+        logger.info(f"Tracked set at cycle start: {union}")
     except Exception:
         pass
-    if not data["users"]:
+    if not data.get("by_user"):
         return
         
+    # Build reverse index: username -> list[user_id]
+    owner_index = {}
+    for uid, bucket in data.get("by_user", {}).items():
+        for uname in bucket.get("targets", {}).keys():
+            owner_index.setdefault(uname, []).append(uid)
+
     async with aiohttp.ClientSession() as session:
         # Use a snapshot list to allow renames/removals safely during iteration
-        for i, (username, user_data) in enumerate(list(data["users"].items())):
+        for i, username in enumerate(list(owner_index.keys())):
             # Rate limit protection
             if i > 0:
                 await asyncio.sleep(10)  # 10s between requests
             
             try:
-                # If this username was removed after we loaded 'data', skip it
+                # If this username was removed after we built the index, skip it
                 latest = load_data()
-                if username not in latest.get("users", {}):
-                    logger.info(f"Skipping @{username} - removed from tracking before fetch")
+                latest_index = set()
+                for uid, b in latest.get("by_user", {}).items():
+                    if username in b.get("targets", {}):
+                        latest_index.add(uid)
+                if not latest_index:
+                    logger.info(f"Skipping @{username} - removed from all owners before fetch")
                     continue
                 current = await fetch_instagram_data(session, username)
                 
@@ -660,139 +699,158 @@ async def check_instagram():
                     # If 'not_found', try to detect a handle rename and migrate
                     if current == "not_found":
                         try:
-                            new_username = await try_detect_username_change(session, username, user_data)
+                            # Try with any owner's stored data
+                            sample_owner = next(iter(latest_index))
+                            sample_data = latest["by_user"][sample_owner]["targets"][username]
+                            new_username = await try_detect_username_change(session, username, sample_data)
                             if new_username and new_username != username:
-                                # migrate key
-                                data["users"][new_username] = data["users"].pop(username)
-                                data["users"][new_username]["last_checked"] = datetime.utcnow().isoformat()
+                                # migrate for all owners
+                                for uid in list(latest_index):
+                                    bucket = data["by_user"][uid]["targets"]
+                                    bucket[new_username] = bucket.pop(username)
+                                    bucket[new_username]["last_checked"] = datetime.utcnow().isoformat()
+                                    if current and current.get("id"):
+                                        bucket[new_username]["instagram_id"] = current.get("id")
                                 save_data(data)
-                                await notify_user(
-                                    user_data["added_by"],
-                                    build_embed(
-                                        "🆕 Username Changed",
-                                        f"@{username} is now @{new_username}",
-                                        {**user_data, "username": new_username},
-                                        discord.Color.teal()
+                                # notify every owner
+                                for uid in list(latest_index):
+                                    await notify_user(
+                                        uid,
+                                        build_embed(
+                                            "🆕 Username Changed",
+                                            f"@{username} is now @{new_username}",
+                                            current or {"username": new_username},
+                                            discord.Color.teal()
+                                        )
                                     )
-                                )
                         except Exception as e:
                             logger.warning(f"Rename detection failed for @{username}: {e}")
                     continue
                     
-                # 1. Check if account was reactivated
-                if user_data.get("status") == "not_found":
-                    data["users"][username].pop("status", None)
-                    save_data(data)
-                    await notify_user(
-                        user_data["added_by"],
-                        build_embed(
-                            "✅ Account Reactivated",
-                            f"@{username} is back online",
-                            current,
-                            discord.Color.green()
+                # 1. If any owner's copy was 'not_found', reactivate per-owner
+                for uid in list(latest_index):
+                    owner_bucket = data["by_user"][uid]["targets"][username]
+                    if owner_bucket.get("status") == "not_found":
+                        owner_bucket.pop("status", None)
+                        save_data(data)
+                        await notify_user(
+                            uid,
+                            build_embed(
+                                "✅ Account Reactivated",
+                                f"@{username} is back online",
+                                current,
+                                discord.Color.green()
+                            )
                         )
-                    )
                 
                 # 1b. If Instagram reports a different username for the same account, migrate
                 if current.get("username") and current.get("username") != username:
                     new_username = current.get("username")
-                    data["users"][new_username] = data["users"].pop(username)
-                    data["users"][new_username]["last_checked"] = datetime.utcnow().isoformat()
-                    # Keep instagram_id updated
-                    if current.get("id"):
-                        data["users"][new_username]["instagram_id"] = current.get("id")
+                    for uid in list(latest_index):
+                        bucket = data["by_user"][uid]["targets"]
+                        bucket[new_username] = bucket.pop(username)
+                        bucket[new_username]["last_checked"] = datetime.utcnow().isoformat()
+                        if current.get("id"):
+                            bucket[new_username]["instagram_id"] = current.get("id")
                     save_data(data)
-                    await notify_user(
-                        user_data["added_by"],
-                        build_embed(
-                            "🆕 Username Changed",
-                            f"@{username} is now @{new_username}",
-                            current,
-                            discord.Color.teal()
+                    for uid in list(latest_index):
+                        await notify_user(
+                            uid,
+                            build_embed(
+                                "🆕 Username Changed",
+                                f"@{username} is now @{new_username}",
+                                current,
+                                discord.Color.teal()
+                            )
                         )
-                    )
                     # Continue processing under new key in next cycles
                     continue
 
                 # 2. Verify account status
                 if current == "not_found":
-                    if user_data.get("status") != "not_found":
-                        data["users"][username]["status"] = "not_found"
-                        save_data(data)
-                        await notify_user(
-                            user_data["added_by"],
-                            build_embed(
-                                "⚠️ Account Unavailable",
-                                f"@{username} was deleted or deactivated",
-                                user_data,
-                                discord.Color.red()
+                    for uid in list(latest_index):
+                        owner_bucket = data["by_user"][uid]["targets"][username]
+                        if owner_bucket.get("status") != "not_found":
+                            owner_bucket["status"] = "not_found"
+                            save_data(data)
+                            await notify_user(
+                                uid,
+                                build_embed(
+                                    "⚠️ Account Unavailable",
+                                    f"@{username} was deleted or deactivated",
+                                    owner_bucket,
+                                    discord.Color.red()
+                                )
                             )
-                        )
                     continue
                 
                 # --- Start of change detection ---
                 something_changed = False
 
                 # 3. Check verification status
-                if user_data.get("is_verified") != current.get("is_verified"):
-                    something_changed = True
-                    data["users"][username]["is_verified"] = current["is_verified"]
-                    await notify_user(
-                        user_data["added_by"],
-                        build_embed(
-                            "🔰 Verification Change",
-                            f"@{username} is now {'VERIFIED' if current['is_verified'] else 'UNVERIFIED'}",
-                            current,
-                            discord.Color.gold() if current['is_verified'] else discord.Color.light_grey()
+                for uid in list(latest_index):
+                    owner_bucket = data["by_user"][uid]["targets"][username]
+                    if owner_bucket.get("is_verified") != current.get("is_verified"):
+                        something_changed = True
+                        owner_bucket["is_verified"] = current["is_verified"]
+                        await notify_user(
+                            uid,
+                            build_embed(
+                                "🔰 Verification Change",
+                                f"@{username} is now {'VERIFIED' if current['is_verified'] else 'UNVERIFIED'}",
+                                current,
+                                discord.Color.gold() if current['is_verified'] else discord.Color.light_grey()
+                            )
                         )
-                    )
-                
+
                 # 4. Check follower changes
-                old_followers = user_data.get("followers", 0)
                 new_followers = current.get("followers", 0)
-                
-                if old_followers != new_followers:
-                    something_changed = True
-                    diff = new_followers - old_followers
-                    data["users"][username]["followers"] = new_followers
-                    await notify_user(
-                        user_data["added_by"],
-                        build_embed(
-                            "📈 Follower Update",
-                            f"`{diff:+,}` change since last check",
-                            current,
-                            discord.Color.purple()
+                for uid in list(latest_index):
+                    owner_bucket = data["by_user"][uid]["targets"][username]
+                    old_followers = owner_bucket.get("followers", 0)
+                    if old_followers != new_followers:
+                        something_changed = True
+                        diff = new_followers - old_followers
+                        owner_bucket["followers"] = new_followers
+                        await notify_user(
+                            uid,
+                            build_embed(
+                                "📈 Follower Update",
+                                f"`{diff:+,}` change since last check",
+                                current,
+                                discord.Color.purple()
+                            )
                         )
-                    )
 
                 # 5. Check bio changes
-                old_bio = user_data.get("bio", "")
                 new_bio = current.get("bio", "")
-
-                if old_bio != new_bio:
-                    something_changed = True
-                    data["users"][username]["bio"] = new_bio
-                    
-                    bio_embed = discord.Embed(
-                        title="📝 Bio Changed",
-                        description=f"The bio for @{username} has been updated.",
-                        color=discord.Color.orange()
-                    )
-                    bio_embed.add_field(name="Old Bio", value=(old_bio or "N/A")[:1024], inline=False)
-                    bio_embed.add_field(name="New Bio", value=(new_bio or "N/A")[:1024], inline=False)
-                    if current.get("profile_pic_url"):
-                        bio_embed.set_thumbnail(url=current["profile_pic_url"])
-                    bio_embed.set_footer(text=f"Tracked by Instagram Tracker • {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
-
-                    await notify_user(user_data["added_by"], bio_embed)
+                for uid in list(latest_index):
+                    owner_bucket = data["by_user"][uid]["targets"][username]
+                    old_bio = owner_bucket.get("bio", "")
+                    if old_bio != new_bio:
+                        something_changed = True
+                        owner_bucket["bio"] = new_bio
+                        bio_embed = discord.Embed(
+                            title="📝 Bio Changed",
+                            description=f"The bio for @{username} has been updated.",
+                            color=discord.Color.orange()
+                        )
+                        bio_embed.add_field(name="Old Bio", value=(old_bio or "N/A")[:1024], inline=False)
+                        bio_embed.add_field(name="New Bio", value=(new_bio or "N/A")[:1024], inline=False)
+                        if current.get("profile_pic_url"):
+                            bio_embed.set_thumbnail(url=current["profile_pic_url"])
+                        bio_embed.set_footer(text=f"Tracked by Instagram Tracker • {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
+                        await notify_user(uid, bio_embed)
 
                 # --- End of change detection ---
 
                 # Finally, update the last checked timestamp and save if needed
-                data["users"][username]["last_checked"] = datetime.utcnow().isoformat()
-                # Update instagram_id if we have a new one
-                if current.get("id"):
-                    data["users"][username]["instagram_id"] = current.get("id")
+                # Update per-owner last_checked and id
+                for uid in list(latest_index):
+                    owner_bucket = data["by_user"][uid]["targets"][username]
+                    owner_bucket["last_checked"] = datetime.utcnow().isoformat()
+                    if current.get("id"):
+                        owner_bucket["instagram_id"] = current.get("id")
                 if something_changed:
                     save_data(data)
                     
