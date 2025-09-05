@@ -288,6 +288,7 @@ RENDER_HINT = os.getenv("RENDER") or os.getenv("RENDER_SERVICE_ID") or os.getenv
 DEFAULT_DATA_DIR = "/var/data" if os.path.isdir("/var/data") or RENDER_HINT else os.path.join(".", ".localdata")
 DATA_DIR = os.getenv("DATA_DIR", DEFAULT_DATA_DIR)
 DATA_FILE = os.path.join(DATA_DIR, "data.json")
+MIGRATE_LEGACY = str(os.getenv("ENABLE_LEGACY_MIGRATE", "false")).lower() == "true"
 
 def _ensure_data_dir():
     try:
@@ -296,14 +297,16 @@ def _ensure_data_dir():
         logger.error(f"Failed to create data dir {DATA_DIR}: {e}")
 
 def _migrate_legacy_file():
-    """If legacy ./data.json exists and persistent file doesn't, migrate once."""
+    """Optionally migrate legacy ./data.json -> DATA_FILE if enabled and target missing."""
+    if not MIGRATE_LEGACY:
+        logger.info("Legacy migration disabled (ENABLE_LEGACY_MIGRATE=false)")
+        return
     legacy_path = os.path.join(".", "data.json")
     if os.path.exists(legacy_path) and not os.path.exists(DATA_FILE):
         try:
             with open(legacy_path, "r") as f:
                 raw = f.read()
-            # Validate JSON before migrating
-            _ = json.loads(raw)
+            _ = json.loads(raw)  # validate JSON
             with open(DATA_FILE, "w") as f:
                 f.write(raw)
             logger.info(f"Migrated legacy data from {legacy_path} to {DATA_FILE}")
@@ -312,6 +315,7 @@ def _migrate_legacy_file():
 
 _ensure_data_dir()
 _migrate_legacy_file()
+logger.info(f"Storage configured. DATA_DIR={DATA_DIR} DATA_FILE={DATA_FILE}")
 
 @bot.event
 async def on_ready():
@@ -343,11 +347,15 @@ def load_data():
                         continue
                     user_bucket = data["by_user"].setdefault(owner, {"targets": {}})
                     user_bucket["targets"][uname] = info
-                # Clear legacy after migration to avoid duplicate processing
+                # Clear legacy after migration to avoid duplicate processing and persist it immediately
                 data["users"] = {}
+                try:
+                    save_data(data)
+                except Exception:
+                    pass
             return data
     except (FileNotFoundError, json.JSONDecodeError):
-        return {"users": {}, "meta": {"last_checked": ""}}
+        return {"users": {}, "by_user": {}, "meta": {"last_checked": ""}}
 
 def save_data(data):
     data["meta"]["last_checked"] = datetime.utcnow().isoformat()
@@ -527,13 +535,44 @@ async def try_detect_username_change(session, old_username: str, stored_user_dat
 @bot.tree.command(name="storageinfo", description="Show current storage path and tracked usernames (ephemeral)")
 async def storage_info(interaction: discord.Interaction):
     data = load_data()
-    usernames = ", ".join(sorted(list(data.get("users", {}).keys()))) or "(none)"
+    # Per-user view
+    uid = str(interaction.user.id)
+    my = sorted(list(data.get("by_user", {}).get(uid, {}).get("targets", {}).keys()))
+    # Union view
+    union = sorted({u for _, b in data.get("by_user", {}).items() for u in b.get("targets", {}).keys()})
+    # File stats
+    try:
+        st = os.stat(DATA_FILE)
+        size = st.st_size
+        mtime = datetime.utcfromtimestamp(st.st_mtime).isoformat()
+    except Exception:
+        size = 0
+        mtime = "?"
     msg = (
         f"DATA_DIR: {DATA_DIR}\n"
-        f"DATA_FILE: {DATA_FILE}\n"
-        f"Tracked: {usernames}"
+        f"DATA_FILE: {DATA_FILE} (size={size}B, mtime={mtime}Z)\n"
+        f"Your tracked: {', '.join(my) if my else '(none)'}\n"
+        f"Union tracked count: {len(union)}"
     )
     await interaction.response.send_message(msg, ephemeral=True)
+
+@bot.tree.command(name="storagewipe", description="Wipe storage file (feature-flagged)")
+async def storage_wipe(interaction: discord.Interaction):
+    if not RESET_ALL_ENABLED:
+        await interaction.response.send_message(
+            "❌ storagewipe disabled. Set RESET_ALL_ENABLED=true and redeploy to enable.",
+            ephemeral=True
+        )
+        return
+    try:
+        if os.path.exists(DATA_FILE):
+            os.remove(DATA_FILE)
+        # Recreate empty structure
+        data = {"users": {}, "by_user": {}, "meta": {"last_checked": ""}}
+        save_data(data)
+        await interaction.response.send_message("🧯 Storage file wiped and reinitialized.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"⚠️ Failed to wipe storage: {e}", ephemeral=True)
 
 @bot.tree.command(name="purgeuser", description="Force remove a username from persistent storage (owner only)")
 async def purge_user(interaction: discord.Interaction, username: str):
@@ -557,6 +596,8 @@ async def clear_bucket(interaction: discord.Interaction):
     bucket = data.setdefault("by_user", {}).setdefault(user_id, {"targets": {}})
     cleared = len(bucket.get("targets", {}))
     bucket["targets"] = {}
+    # Also clear any legacy top-level users for safety
+    data["users"] = {}
     save_data(data)
     await interaction.response.send_message(
         f"🧹 Cleared {cleared} tracked account(s) from your bucket. You will no longer receive DMs until you add users again.",
