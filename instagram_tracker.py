@@ -503,6 +503,34 @@ async def add_user(interaction: discord.Interaction, username: str):
         )
         await interaction.followup.send(embed=embed)
 
+@bot.tree.command(name="forceadd", description="Track a username even if currently unavailable (will notify on reactivation/rename)")
+async def force_add(interaction: discord.Interaction, username: str):
+    await interaction.response.defer(ephemeral=True)
+    username = username.lower()
+    data = load_data()
+    user_id = str(interaction.user.id)
+    bucket = data.setdefault("by_user", {}).setdefault(user_id, {"targets": {}})
+    if username in bucket["targets"]:
+        await interaction.followup.send(f"`@{username}` is already in your tracking list.", ephemeral=True)
+        return
+    # Create a placeholder with not_found status so the loop will watch for reactivation/rename
+    bucket["targets"][username] = {
+        "added_by": user_id,
+        "added_at": datetime.utcnow().isoformat(),
+        "instagram_id": None,
+        "followers": 0,
+        "is_verified": False,
+        "bio": "",
+        "profile_pic_url": "",
+        "status": "not_found",
+        "last_checked": datetime.utcnow().isoformat()
+    }
+    save_data(data)
+    await interaction.followup.send(
+        f"✅ Now tracking placeholder for `@{username}`. You'll get a DM if it reactivates or if we detect a rename.",
+        ephemeral=True
+    )
+
 @bot.tree.command(name="checkuser", description="Immediately check one of YOUR tracked usernames and notify if needed")
 async def check_user_now(interaction: discord.Interaction, username: str):
     await interaction.response.defer(ephemeral=True)
