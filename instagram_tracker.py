@@ -484,6 +484,81 @@ async def add_user(interaction: discord.Interaction, username: str):
         )
         await interaction.followup.send(embed=embed)
 
+@bot.tree.command(name="checkuser", description="Immediately check one of YOUR tracked usernames and notify if needed")
+async def check_user_now(interaction: discord.Interaction, username: str):
+    await interaction.response.defer(ephemeral=True)
+    username = username.lower()
+    data = load_data()
+    user_id = str(interaction.user.id)
+    bucket = data.setdefault("by_user", {}).setdefault(user_id, {"targets": {}})
+    if username not in bucket["targets"]:
+        await interaction.followup.send(f"@{username} is not in your tracked list.", ephemeral=True)
+        return
+    async with aiohttp.ClientSession() as session:
+        current = await fetch_instagram_data(session, username)
+        # not_found path -> try rename, else mark unavailable
+        if current == "not_found":
+            try:
+                new_username = await try_detect_username_change(session, username, bucket["targets"][username])
+                if new_username and new_username != username:
+                    bucket["targets"][new_username] = bucket["targets"].pop(username)
+                    bucket["targets"][new_username]["last_checked"] = datetime.utcnow().isoformat()
+                    save_data(data)
+                    await notify_user(
+                        user_id,
+                        build_embed(
+                            "🆕 Username Changed",
+                            f"@{username} is now @{new_username}",
+                            {"username": new_username},
+                            discord.Color.teal()
+                        )
+                    )
+                    await interaction.followup.send(f"Checked @{username}: renamed to @{new_username}", ephemeral=True)
+                    return
+            except Exception as e:
+                logger.warning(f"Rename detection failed in /checkuser for @{username}: {e}")
+            if bucket["targets"][username].get("status") != "not_found":
+                bucket["targets"][username]["status"] = "not_found"
+                save_data(data)
+                await notify_user(
+                    user_id,
+                    build_embed(
+                        "⚠️ Account Unavailable",
+                        f"@{username} was deleted or deactivated",
+                        bucket["targets"][username],
+                        discord.Color.red()
+                    )
+                )
+            await interaction.followup.send(f"Checked @{username}: marked unavailable", ephemeral=True)
+            return
+        
+        if not current or isinstance(current, str):
+            await interaction.followup.send(f"Checked @{username}: fetch failed (temporary)", ephemeral=True)
+            return
+        
+        # If previously not_found -> reactivate
+        if bucket["targets"][username].get("status") == "not_found":
+            bucket["targets"][username].pop("status", None)
+            save_data(data)
+            await notify_user(
+                user_id,
+                build_embed(
+                    "✅ Account Reactivated",
+                    f"@{username} is back online",
+                    current,
+                    discord.Color.green()
+                )
+            )
+        # Update snapshot
+        bucket["targets"][username]["followers"] = current.get("followers", bucket["targets"][username].get("followers", 0))
+        bucket["targets"][username]["is_verified"] = current.get("is_verified", bucket["targets"][username].get("is_verified", False))
+        bucket["targets"][username]["bio"] = current.get("bio", bucket["targets"][username].get("bio", ""))
+        bucket["targets"][username]["last_checked"] = datetime.utcnow().isoformat()
+        if current.get("id"):
+            bucket["targets"][username]["instagram_id"] = current.get("id")
+        save_data(data)
+        await interaction.followup.send(f"Checked @{username}: ok", ephemeral=True)
+
 # --- Helper: detect username changes via Instagram topsearch ---
 async def try_detect_username_change(session, old_username: str, stored_user_data: dict) -> str | None:
     """
@@ -755,37 +830,52 @@ async def check_instagram():
                     continue
                 current = await fetch_instagram_data(session, username)
                 
-                # Skip failed checks
-                if not current or isinstance(current, str):
-                    # If 'not_found', try to detect a handle rename and migrate
-                    if current == "not_found":
-                        try:
-                            # Try with any owner's stored data
-                            sample_owner = next(iter(latest_index))
-                            sample_data = latest["by_user"][sample_owner]["targets"][username]
-                            new_username = await try_detect_username_change(session, username, sample_data)
-                            if new_username and new_username != username:
-                                # migrate for all owners
-                                for uid in list(latest_index):
-                                    bucket = data["by_user"][uid]["targets"]
-                                    bucket[new_username] = bucket.pop(username)
-                                    bucket[new_username]["last_checked"] = datetime.utcnow().isoformat()
-                                    if current and current.get("id"):
-                                        bucket[new_username]["instagram_id"] = current.get("id")
-                                save_data(data)
-                                # notify every owner
-                                for uid in list(latest_index):
-                                    await notify_user(
-                                        uid,
-                                        build_embed(
-                                            "🆕 Username Changed",
-                                            f"@{username} is now @{new_username}",
-                                            current or {"username": new_username},
-                                            discord.Color.teal()
-                                        )
+                # Handle special statuses and failures
+                if current == "not_found":
+                    # Try to detect a handle rename first
+                    try:
+                        sample_owner = next(iter(latest_index))
+                        sample_data = latest["by_user"][sample_owner]["targets"][username]
+                        new_username = await try_detect_username_change(session, username, sample_data)
+                        if new_username and new_username != username:
+                            # migrate for all owners
+                            for uid in list(latest_index):
+                                bucket = data["by_user"][uid]["targets"]
+                                bucket[new_username] = bucket.pop(username)
+                                bucket[new_username]["last_checked"] = datetime.utcnow().isoformat()
+                            save_data(data)
+                            # notify every owner about rename
+                            for uid in list(latest_index):
+                                await notify_user(
+                                    uid,
+                                    build_embed(
+                                        "🆕 Username Changed",
+                                        f"@{username} is now @{new_username}",
+                                        {"username": new_username},
+                                        discord.Color.teal()
                                     )
-                        except Exception as e:
-                            logger.warning(f"Rename detection failed for @{username}: {e}")
+                                )
+                            continue  # handled via rename
+                    except Exception as e:
+                        logger.warning(f"Rename detection failed for @{username}: {e}")
+                    # No rename found -> mark unavailable and notify owners
+                    for uid in list(latest_index):
+                        owner_bucket = data["by_user"][uid]["targets"][username]
+                        if owner_bucket.get("status") != "not_found":
+                            owner_bucket["status"] = "not_found"
+                            save_data(data)
+                            await notify_user(
+                                uid,
+                                build_embed(
+                                    "⚠️ Account Unavailable",
+                                    f"@{username} was deleted or deactivated",
+                                    owner_bucket,
+                                    discord.Color.red()
+                                )
+                            )
+                    continue
+                elif (not current) or isinstance(current, str):
+                    # Other failures: skip silently for now
                     continue
                     
                 # 1. If any owner's copy was 'not_found', reactivate per-owner
@@ -827,23 +917,7 @@ async def check_instagram():
                     # Continue processing under new key in next cycles
                     continue
 
-                # 2. Verify account status
-                if current == "not_found":
-                    for uid in list(latest_index):
-                        owner_bucket = data["by_user"][uid]["targets"][username]
-                        if owner_bucket.get("status") != "not_found":
-                            owner_bucket["status"] = "not_found"
-                            save_data(data)
-                            await notify_user(
-                                uid,
-                                build_embed(
-                                    "⚠️ Account Unavailable",
-                                    f"@{username} was deleted or deactivated",
-                                    owner_bucket,
-                                    discord.Color.red()
-                                )
-                            )
-                    continue
+                # 2. Verify account status (handled above for not_found cases)
                 
                 # --- Start of change detection ---
                 something_changed = False
