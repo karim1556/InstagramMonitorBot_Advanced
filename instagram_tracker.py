@@ -321,11 +321,30 @@ logger.info(f"Storage configured. DATA_DIR={DATA_DIR} DATA_FILE={DATA_FILE}")
 async def on_ready():
     logger.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
     try:
-        synced = await bot.tree.sync()
-        logger.info(f"Synced {len(synced)} command(s)")
+        # Fast register in each guild for immediate availability
+        total = 0
+        for g in bot.guilds:
+            cmds = await bot.tree.sync(guild=g)
+            total += len(cmds)
+            logger.info(f"Synced {len(cmds)} command(s) in guild {g.name} ({g.id})")
+        # Also ensure global sync eventually
+        gcmds = await bot.tree.sync()
+        logger.info(f"Global sync registered {len(gcmds)} command(s); per-guild total={total}")
     except Exception as e:
         logger.error(f"Command sync error: {e}")
     check_instagram.start()
+
+@bot.tree.command(name="resync", description="Manually resync slash commands (ephemeral)")
+async def resync_commands(interaction: discord.Interaction):
+    try:
+        cmds_guild = await bot.tree.sync(guild=interaction.guild) if interaction.guild else []
+        cmds_global = await bot.tree.sync()
+        await interaction.response.send_message(
+            f"Resynced: guild={len(cmds_guild)} global={len(cmds_global)}",
+            ephemeral=True
+        )
+    except Exception as e:
+        await interaction.response.send_message(f"Resync failed: {e}", ephemeral=True)
 
 def load_data():
     try:
