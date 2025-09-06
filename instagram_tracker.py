@@ -288,6 +288,7 @@ RENDER_HINT = os.getenv("RENDER") or os.getenv("RENDER_SERVICE_ID") or os.getenv
 DEFAULT_DATA_DIR = "/var/data" if os.path.isdir("/var/data") or RENDER_HINT else os.path.join(".", ".localdata")
 DATA_DIR = os.getenv("DATA_DIR", DEFAULT_DATA_DIR)
 DATA_FILE = os.path.join(DATA_DIR, "data.json")
+BACKUP_FILE = os.path.join(DATA_DIR, "data.backup.json")
 MIGRATE_LEGACY = str(os.getenv("ENABLE_LEGACY_MIGRATE", "false")).lower() == "true"
 
 def _ensure_data_dir():
@@ -295,6 +296,20 @@ def _ensure_data_dir():
         os.makedirs(DATA_DIR, exist_ok=True)
     except Exception as e:
         logger.error(f"Failed to create data dir {DATA_DIR}: {e}")
+
+def _ensure_data_file():
+    """Create an empty data file if missing so Render cold starts don't show empty stats."""
+    if not os.path.exists(DATA_FILE):
+        try:
+            tmp_path = DATA_FILE + ".init"
+            with open(tmp_path, "w") as f:
+                json.dump({"users": {}, "by_user": {}, "meta": {"last_checked": ""}}, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, DATA_FILE)
+            logger.info(f"Created new storage file at {DATA_FILE}")
+        except Exception as e:
+            logger.error(f"Failed to create storage file {DATA_FILE}: {e}")
 
 def _migrate_legacy_file():
     """Optionally migrate legacy ./data.json -> DATA_FILE if enabled and target missing."""
@@ -315,6 +330,7 @@ def _migrate_legacy_file():
 
 _ensure_data_dir()
 _migrate_legacy_file()
+_ensure_data_file()
 logger.info(f"Storage configured. DATA_DIR={DATA_DIR} DATA_FILE={DATA_FILE}")
 
 @bot.event
@@ -348,6 +364,9 @@ async def resync_commands(interaction: discord.Interaction):
 
 def load_data():
     try:
+        # If primary exists but is empty, treat as corrupt and raise to fallback
+        if os.path.exists(DATA_FILE) and os.path.getsize(DATA_FILE) == 0:
+            raise json.JSONDecodeError("empty file", "", 0)
         with open(DATA_FILE, "r") as f:
             data = json.load(f)
             # If completely empty, seed structure
@@ -374,6 +393,23 @@ def load_data():
                     pass
             return data
     except (FileNotFoundError, json.JSONDecodeError):
+        # Try restoring from backup first
+        try:
+            if os.path.exists(BACKUP_FILE) and os.path.getsize(BACKUP_FILE) > 0:
+                with open(BACKUP_FILE, "r") as b:
+                    backup = json.load(b)
+                # Write it back to primary
+                save_data(backup)
+                logger.warning("Primary storage was missing/corrupt; restored from backup")
+                return backup
+        except Exception as e:
+            logger.error(f"Failed to restore from backup: {e}
+")
+        # If backup not available, (re)create empty file
+        try:
+            _ensure_data_file()
+        except Exception:
+            pass
         return {"users": {}, "by_user": {}, "meta": {"last_checked": ""}}
 
 def save_data(data):
@@ -382,7 +418,16 @@ def save_data(data):
     try:
         with open(tmp_path, "w") as f:
             json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp_path, DATA_FILE)
+        # Also write durable backup
+        btmp = BACKUP_FILE + ".tmp"
+        with open(btmp, "w") as bf:
+            json.dump(data, bf, indent=2)
+            bf.flush()
+            os.fsync(bf.fileno())
+        os.replace(btmp, BACKUP_FILE)
     except Exception as e:
         logger.error(f"Failed to save data atomically to {DATA_FILE}: {e}")
 
