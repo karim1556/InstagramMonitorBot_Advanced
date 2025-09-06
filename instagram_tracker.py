@@ -403,8 +403,7 @@ def load_data():
                 logger.warning("Primary storage was missing/corrupt; restored from backup")
                 return backup
         except Exception as e:
-            logger.error(f"Failed to restore from backup: {e}
-")
+            logger.error(f"Failed to restore from backup: {e}")
         # If backup not available, (re)create empty file
         try:
             _ensure_data_file()
